@@ -7,13 +7,47 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+# This model enhances a standard autoregressive transformer decoder by introducing an uncertainty-aware token
+# that captures the model's confidence in previous predictions. A "distribution context" is maintained alongside
+# the token context, tracking the model's probability distributions over the vocabulary. The distribution context
+# is initialized with special distributions and evolves in sync with the token context, ensuring that uncertainty 
+# information is used to inform future predictions.
+#
+# 1. Autoregressive Decoder Setup:
+#    The model operates as a decoder-only transformer, generating tokens one at a time, where each token depends 
+#    only on the previous tokens in the sequence. A distribution context is maintained for the last L tokens.
+# 
+# 2. Distribution Context Initialization and Evolution:
+#    - Initial state: The distribution context is initialized with Dirac delta functions for each token in the 
+#      context, representing certainty in the known tokens.
+#    - Padding: If fewer tokens are present than the context size L, the context is padded.
+#    - Update: New probability distributions generated during the forward pass are inserted into the context, 
+#      replacing the oldest, mimicking how tokens are added to the token context.
+#
+# 3. Processing the Distribution Context:
+#    The stored probability distributions are processed by a CNN to extract patterns. The output is pooled and passed
+#    through an MLP to produce an embedding representing the uncertainty across the context window.
+#
+# 4. Appending the Uncertainty-Aware Token:
+#    This uncertainty-aware embedding is treated as token L+1 and appended to the sequence of token embeddings,
+#    resulting in a tensor of size (B, L+1, d_model).
+#
+# 5. Causal Autoregressive Rollout:
+#    The model respects causality by attending only to past tokens. A causal mask ensures that no future tokens are
+#    accessed during self-attention. The uncertainty-aware token is included in this attention.
+#
+# 6. Transformer Input and Token Generation:
+#    The enriched sequence, including the uncertainty-aware token, is passed through the transformer to generate 
+#    the next token. This structure allows the model to factor in its own uncertainty during token generation.
+
+
 import math
-import inspect
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import inspect
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -107,13 +141,33 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
+    block_size: int = 1024  # Ensure this is large enough for your use case
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    use_sparse_distributions: bool = False
+    distribution_context_size: int = 1024  # or any other default value
+    d_hidden: int = 128  # Add this line
+
+# {{ Add DistributionEmbedder class }}
+class DistributionEmbedder(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.conv = nn.Conv1d(in_channels=config.vocab_size, out_channels=128, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+        self.fc = nn.Linear(128, config.n_embd)
+
+    def forward(self, distribution_context):
+        # distribution_context shape: (batch_size, context_size, vocab_size)
+        x = distribution_context.permute(0, 2, 1)  # (batch_size, vocab_size, context_size)
+        x = self.conv(x)  # (batch_size, 128, context_size)
+        x = self.relu(x)
+        x = x.mean(dim=2)  # Global average pooling over context_size: (batch_size, 128)
+        x = self.fc(x)  # (batch_size, n_embd)
+        return x
 
 class GPT(nn.Module):
 
@@ -131,29 +185,41 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.transformer.wte.weight = self.lm_head.weight # Weight tying
 
-        # init all weights
+        # Initialize all weights
         self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
-        # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
+        self.distribution_context = None
+        self.use_sparse_distributions = config.use_sparse_distributions
+        self.distribution_context_size = config.distribution_context_size
+
+        # Initialize the distribution context with zeros
+        self.distribution_context = torch.zeros(1, self.distribution_context_size, config.vocab_size)
+
+        # {{ Initialize the DistributionEmbedder }}
+        self.distribution_embedder = DistributionEmbedder(config)
+        
+        # {{ Adjust token embedding size for concatenation }}
+        # Remove or modify this line as we'll be appending a new token, not concatenating embeddings
+        # self.transformer.wte = nn.Embedding(config.vocab_size, config.n_embd * 2)
+        self.transformer.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        
+        # {{ Initialize components for Uncertainty-Aware Token }}
+        self.cnn = nn.Conv1d(in_channels=config.vocab_size, out_channels=128, kernel_size=3, padding=1)  # Adjust channels as needed
+        self.relu = nn.ReLU()
+        self.mlp = nn.Sequential(
+            nn.Linear(128, config.d_hidden),  # config.d_hidden should match model embedding dimension
+            nn.GELU(),
+            nn.Linear(config.d_hidden, config.n_embd)
+        )
+        
     def get_num_params(self, non_embedding=True):
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
             n_params -= self.transformer.wpe.weight.numel()
@@ -171,95 +237,164 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        
+        # Initialize distribution context if it's None or not properly shaped
+        if self.distribution_context is None or self.distribution_context.size(0) != b:
+            self._init_distribution_context(idx)
+        
+        # Generate additional embedding from distribution context
+        distribution_emb = self.distribution_embedder(self.distribution_context)  # Shape: (b, n_embd)
+        distribution_emb = distribution_emb.unsqueeze(1)  # Shape: (b, 1, n_embd)
+        
+        # Generate token embeddings
+        tok_emb = self.transformer.wte(idx)  # Shape: (b, t, n_embd)
+        
+        # Generate position embeddings (only for the input tokens, not for the uncertainty token)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        pos_emb = self.transformer.wpe(pos)  # Shape: (t, n_embd)
+        
+        # Combine token embeddings and positional embeddings
+        x = tok_emb + pos_emb
+        
+        # Append uncertainty-aware embedding (without positional encoding)
+        x = torch.cat((x, distribution_emb), dim=1)  # Shape: (b, t+1, n_embd)
+        
+        # Apply dropout
+        x = self.transformer.drop(x)
+        
+        # Pass through transformer blocks
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            # Training phase
+            logits = self.lm_head(x[:, :-1])  # Exclude the last token (uncertainty token)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            return logits, loss
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+            # Inference phase
+            logits = self.lm_head(x[:, [-2]])  # Use the second-to-last token (last actual token, not uncertainty token)
+            return logits, None
 
-        return logits, loss
+    # {{ Add CNN + MLP pipeline for Uncertainty-Aware Token }}
+    def generate_uncertainty_token(self):
+        # Input to CNN: distribution_context (batch_size, L, V)
+        x = self.distribution_context  # Shape: (batch_size, L, V)
+        x = x.permute(0, 2, 1)  # Shape: (batch_size, V, L)
+        x = self.cnn(x)  # Shape: (batch_size, 128, L)
+        x = self.relu(x)
+        x = x.mean(dim=2)  # Global average pooling: (batch_size, 128)
+        uncertainty_emb = self.mlp(x)  # Shape: (batch_size, n_embd)
+        return uncertainty_emb  # This will be appended as token L+1
+
+    def _init_distribution_context(self, idx):
+        """
+        Initialize the distribution context with Dirac delta distributions for the tokens
+        in the context window, and zeros for the remaining slots.
+        """
+        b, t = idx.size()
+        context_size = min(t, self.distribution_context_size)
+
+        # Initialize with zeros
+        self.distribution_context = torch.zeros(b, self.distribution_context_size, self.config.vocab_size, device=idx.device)
+
+        # Set Dirac deltas for the last 'context_size' tokens
+        dirac_deltas = torch.zeros(b, context_size, self.config.vocab_size, device=idx.device)
+        dirac_deltas.scatter_(2, idx[:, -context_size:].unsqueeze(-1), 1)
+
+        self.distribution_context[:, -context_size:, :] = dirac_deltas
+
+    def _update_distribution_context(self, new_distributions):
+        """
+        Update the distribution context by shifting left and appending new distributions.
+
+        Args:
+            new_distributions (Tensor): Tensor of shape (b, t_new, vocab_size)
+        """
+        b, t_new, vocab_size = new_distributions.size()
+        assert vocab_size == self.config.vocab_size, "Vocabulary size mismatch in distribution context."
+
+        if t_new >= self.distribution_context_size:
+            # Replace entire context with the last 'distribution_context_size' distributions
+            self.distribution_context = new_distributions[:, -self.distribution_context_size:, :]
+        else:
+            # Shift left by 't_new' and append new distributions
+            shifted_context = self.distribution_context[:, t_new:, :] # shape (b, c - t_new, vocab_size)
+            self.distribution_context = torch.cat([shifted_context, new_distributions], dim=1) # shape (b, c, vocab_size)
+
+        if self.use_sparse_distributions:
+            self.distribution_context = self._to_sparse(self.distribution_context)
+
+    def _to_sparse(self, dense_tensor):
+        # Convert dense tensor to sparse
+        return dense_tensor.to_sparse()
+
+    def get_distribution_context(self):
+        """
+        Retrieve the current distribution context.
+
+        Returns:
+            Tensor: Distribution context of shape (b, c, vocab_size)
+        """
+        if self.use_sparse_distributions and self.distribution_context is not None:
+            return self.distribution_context.to_dense()
+        return self.distribution_context
 
     def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self.config.block_size
+        """
+        Model surgery to decrease the block size if necessary.
+
+        Args:
+            block_size (int): New block size to crop to.
+        """
+        assert block_size <= self.config.block_size, "New block size must be less than or equal to the current block size."
         self.config.block_size = block_size
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
-    @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {} # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Generate new tokens by iteratively sampling from the model's output distributions.
 
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-        }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        config_args['bias'] = True # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
-        if 'dropout' in override_args:
-            print(f"overriding dropout rate to {override_args['dropout']}")
-            config_args['dropout'] = override_args['dropout']
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+        Args:
+            idx (Tensor): Tensor of shape (b, t) containing input token IDs.
+            max_new_tokens (int): Number of tokens to generate.
+            temperature (float): Scaling factor for logits.
+            top_k (int, optional): Truncate distributions to top k tokens.
 
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
+        Returns:
+            Tensor: Generated token IDs of shape (b, t + max_new_tokens)
+        """
+        # Initialize distribution context with Dirac deltas for the input sequence
+        if self.distribution_context is None:
+            self._init_distribution_context(idx)
 
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
+        for _ in range(max_new_tokens):
+            # Adjust the sequence cropping to leave room for the uncertainty-aware token
+            idx_cond = idx if idx.size(1) < self.config.block_size else idx[:, -(self.config.block_size-1):]
+            # Forward the model to get the logits for the index in the sequence
+            logits, _ = self(idx_cond)
+            # Pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # Optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # Apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # Sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # Append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
 
-        return model
+            # Update distribution context with the new distribution
+            self._update_distribution_context(probs.unsqueeze(1))  # Shape: (b, 1, vocab_size)
 
+        return idx
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -328,3 +463,16 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+
+
+
+
+
+
+
+
+
+
+
+

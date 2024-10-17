@@ -27,7 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+import importlib
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -70,8 +70,10 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+dtype = 'float16'  # Force float16 to ensure compatibility with sm_75 GPUs
 compile = True # use PyTorch 2.0 to compile the model to be faster
+# Add this to the config section
+#mixer_k = 5  # number of recent distributions to consider in the MLP mixer
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -146,6 +148,18 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+
+# Dynamically import the correct model based on the use_old_model flag
+if use_old_model:
+    print("Using the old model as baseline")
+    model_module = importlib.import_module('model_old')
+else:
+    print("Using the current model")
+    model_module = importlib.import_module('model')
+
+GPTConfig = model_module.GPTConfig
+GPT = model_module.GPT
+
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -221,7 +235,12 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                output = model(X, Y)
+                # Check if the output is a tuple and extract loss
+                if isinstance(output, tuple):
+                    loss = output[-1]  # Assume loss is the last element
+                else:
+                    loss = output  # If it's not a tuple, assume it's just the loss
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -297,7 +316,11 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            output = model(X, Y)
+            if isinstance(output, tuple):
+                loss = output[-1]  # Assume loss is the last element
+            else:
+                loss = output  # If it's not a tuple, assume it's just the loss
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')

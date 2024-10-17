@@ -17,18 +17,61 @@ max_new_tokens = 500 # number of tokens generated in each sample
 temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
 top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
 seed = 1337
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
+device = 'cpu' # default to CPU to avoid CUDA issues
+dtype = 'float32' # default to float32 to avoid potential issues with other dtypes
 compile = False # use PyTorch 2.0 to compile the model to be faster
-exec(open('configurator.py').read()) # overrides from command line or config file
+
+# Try to load configurator.py, but continue if it's not found
+config_file = 'configurator.py'
+if os.path.exists(config_file):
+    print(f"Loading configuration from {config_file}")
+    with open(config_file, 'r') as f:
+        exec(f.read())
+else:
+    print(f"Warning: {config_file} not found. Using default configuration.")
+
+# Override configuration with command-line arguments
+import sys
+for arg in sys.argv[1:]:
+    if '=' in arg:
+        key, value = arg.split('=')
+        key = key.lstrip('-')
+        if key in globals():
+            try:
+                globals()[key] = type(globals()[key])(value)
+            except ValueError:
+                print(f"Warning: Could not convert {value} to the type of {key}. Skipping.")
+        else:
+            print(f"Warning: Unknown configuration key: {key}. Skipping.")
+
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+
+# Safely check CUDA availability
+try:
+    cuda_available = torch.cuda.is_available()
+    if cuda_available and 'cuda' in device:
+        torch.cuda.manual_seed(seed)
+        torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
+        torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+        device_type = 'cuda'
+    else:
+        device_type = 'cpu'
+        device = 'cpu'
+except Exception as e:
+    print(f"Error checking CUDA availability: {e}")
+    print("Defaulting to CPU.")
+    device_type = 'cpu'
+    device = 'cpu'
+
+# Safely set dtype
+try:
+    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+except KeyError:
+    print(f"Unsupported dtype: {dtype}. Defaulting to float32.")
+    ptdtype = torch.float32
+
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # model
