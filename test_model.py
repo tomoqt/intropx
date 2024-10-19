@@ -1,6 +1,11 @@
 import torch
 import pytest
 from model import GPT, GPTConfig
+import torch.optim as optim
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 @pytest.fixture
 def gpt_model():
@@ -14,7 +19,8 @@ def gpt_model():
         bias=True,
         use_sparse_distributions=False,
         distribution_context_size=64,
-        d_hidden=64  # Make sure this matches the value in the original fixture
+        d_hidden=64,
+        debug=True  # Enable debugging
     )
     return GPT(config)
 
@@ -116,3 +122,86 @@ def test_mfu_estimation(gpt_model):
     mfu = gpt_model.estimate_mfu(fwdbwd_per_iter=1, dt=1.0)
     assert isinstance(mfu, float)
     assert mfu > 0
+
+def test_convolution_backpropagation(gpt_model):
+    logging.info("Starting test_convolution_backpropagation")
+    # Ensure model is in training mode
+    gpt_model.train()
+
+    # Create a small batch of data
+    batch_size = 2
+    seq_length = 10
+    idx = torch.randint(0, gpt_model.config.vocab_size, (batch_size, seq_length))
+    targets = torch.randint(0, gpt_model.config.vocab_size, (batch_size, seq_length))
+
+    # Initialize optimizer
+    optimizer = optim.Adam(gpt_model.parameters())
+
+    # Forward pass
+    logits, loss = gpt_model(idx, targets=targets)
+
+    # Check if loss is valid
+    assert loss is not None
+    assert not torch.isnan(loss)
+    assert loss.item() > 0
+
+    logging.info(f"Loss before backward pass: {loss.item()}")
+
+    # Backward pass
+    optimizer.zero_grad()
+    loss.backward()
+
+    logging.info("Backward pass completed")
+
+    # Check if gradients are computed for convolution layers
+    assert gpt_model.distribution_embedder.conv.weight.grad is not None
+    grad_norm = torch.sum(torch.abs(gpt_model.distribution_embedder.conv.weight.grad))
+    logging.info(f"Distribution embedder conv grad norm: {grad_norm}")
+    assert grad_norm > 0
+
+    # Check if gradients are computed for the uncertainty-aware token generation
+    assert gpt_model.cnn.weight.grad is not None
+    grad_norm = torch.sum(torch.abs(gpt_model.cnn.weight.grad))
+    logging.info(f"CNN grad norm: {grad_norm}")
+    assert grad_norm > 0
+
+    # Check other important layers
+    assert gpt_model.transformer.wte.weight.grad is not None
+    assert gpt_model.lm_head.weight.grad is not None
+
+    logging.info("test_convolution_backpropagation completed successfully")
+
+def test_end_to_end_training(gpt_model):
+    # Ensure model is in training mode
+    gpt_model.train()
+
+    # Create a small batch of data
+    batch_size = 4
+    seq_length = 20
+    idx = torch.randint(0, gpt_model.config.vocab_size, (batch_size, seq_length))
+    targets = torch.randint(0, gpt_model.config.vocab_size, (batch_size, seq_length))
+
+    # Initialize optimizer
+    optimizer = optim.Adam(gpt_model.parameters())
+
+    # Perform multiple training steps
+    n_steps = 5
+    for _ in range(n_steps):
+        optimizer.zero_grad()
+        logits, loss = gpt_model(idx, targets=targets)
+        loss.backward()
+        optimizer.step()
+
+        # Check if loss is decreasing
+        assert loss.item() > 0
+        if _ > 0:
+            assert loss.item() < prev_loss
+        prev_loss = loss.item()
+
+    # Check if distribution context is updated
+    assert gpt_model.distribution_context is not None
+    assert not torch.all(gpt_model.distribution_context == 0)
+
+    # Generate some tokens
+    generated = gpt_model.generate(idx[:, :5], max_new_tokens=10)
+    assert generated.shape == (batch_size, 15)  # 5 input tokens + 10 new tokens
