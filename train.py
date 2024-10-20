@@ -72,8 +72,8 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'float16'  # Force float16 to ensure compatibility with sm_75 GPUs
 compile = False#True # use PyTorch 2.0 to compile the model to be faster
-# Add this to the config section
-#mixer_k = 5  # number of recent distributions to consider in the MLP mixer
+# Add the use_old_model flag
+use_old_model = False  # If True, use model_old.py instead of model.py
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -357,3 +357,4 @@ while True:
 
 if ddp:
     destroy_process_group()
+

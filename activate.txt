@@ -2,7 +2,7 @@ source venv/bin/activate
 python sample.py --out_dir=out-shakespeare-char
 python train.py config/train_shakespeare_char.py
 
-
+--use_old_model=True
 git clone https://github.com/tomoqt/intropx.git
 pip install -r requirements.txt
 python data/openwebtext/prepare.py
