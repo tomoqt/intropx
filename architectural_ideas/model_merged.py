@@ -116,7 +116,8 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            # Replace the token embedding layer with a linear layer that accepts distributions
+            wte = nn.Linear(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
@@ -131,12 +132,12 @@ class GPT(nn.Module):
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
-        # Distribution MLP
-        self.dist_mlp = nn.Sequential(
-            nn.Linear(config.vocab_size, config.d_hidden),
-            nn.ReLU(),
-            nn.Linear(config.d_hidden, config.n_embd)
-        )
+        # Remove the Distribution MLP
+        # self.dist_mlp = nn.Sequential(
+        #     nn.Linear(config.vocab_size, config.d_hidden),
+        #     nn.ReLU(),
+        #     nn.Linear(config.d_hidden, config.n_embd)
+        # )
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
@@ -159,26 +160,15 @@ class GPT(nn.Module):
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
 
-        # Generate token embeddings
-        tok_emb = self.transformer.wte(idx)  # Shape: (b, t, n_embd)
+        # Generate token embeddings from distributions
+        tok_emb = self.transformer.wte(distributions)  # Shape: (b, t, n_embd)
 
         # Generate position embeddings
         pos = torch.arange(0, t, dtype=torch.long, device=device)
         pos_emb = self.transformer.wpe(pos)  # Shape: (t, n_embd)
 
-        # Generate distributions corresponding to idx
-        if distributions is None:
-            # In training, use one-hot vectors
-            distributions = F.one_hot(idx, num_classes=self.config.vocab_size).float()  # Shape: (b, t, vocab_size)
-        else:
-            # Use the provided distributions
-            pass  # distributions is provided, shape (b, t, vocab_size)
-
-        # Process distributions via MLP
-        dist_emb = self.dist_mlp(distributions)  # Shape: (b, t, n_embd)
-
-        # Combine embeddings
-        x = tok_emb + pos_emb + dist_emb  # Shape: (b, t, n_embd)
+        # Combine token and position embeddings
+        x = tok_emb + pos_emb  # Shape: (b, t, n_embd)
 
         # Apply dropout
         x = self.transformer.drop(x)
@@ -281,3 +271,4 @@ class GPT(nn.Module):
         flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
+
