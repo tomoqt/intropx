@@ -1,13 +1,11 @@
 
-# nanoGPT
+# Intropix: a distribution-aware architecture for LLMs
 
-![nanoGPT](assets/nanogpt.jpg)
+Intropix is one of the projects born out of the community research efforts spearheaded by frog and shrek, aka https://x.com/doomslide and https://x.com/_xjdr, with their introduction of entropix (https://github.com/xjdr-alt/entropix). Entropix is a sampler for autoregressive Large Language Models, characterized by the use of entropy and varentropy of the output distribution over the vocabulary during autoregressive rollout to produce an entropy and varentropy-aware sampling. This technique delivers incredible jumps in quality of output and is still in rapid development. This effort serves as a complementary direction to the work on the sampler side, by noticing a specific, underlying phenomenon that could be the reason behind entropix's unreasonable effectiveness. 
 
-The simplest, fastest repository for training/finetuning medium-sized GPTs. It is a rewrite of [minGPT](https://github.com/karpathy/minGPT) that prioritizes teeth over education. Still under active development, but currently the file `train.py` reproduces GPT-2 (124M) on OpenWebText, running on a single 8XA100 40GB node in about 4 days of training. The code itself is plain and readable: `train.py` is a ~300-line boilerplate training loop and `model.py` a ~300-line GPT model definition, which can optionally load the GPT-2 weights from OpenAI. That's it.
+The underlying phenomenon is the fact that current autoregressive transformers throw away all of the distribution's information after having sampled it. Specifically, when the token is reinserted in the context window, it is reinserted as a single token, devoid of the information in the distribution it was sampled from. In this sense, entropix is probably effective because it utilizes some of this information to steer the token extraction process (be it via resampling, injecting CoT tokens) via strong heuristics from the distributions and the model's internal, namely entropy (E[-logp]) varentropy (Var[-logp]) and the corresponding values for the token distributions in multiheaded attention (as well as some more attention connectivity parameters).  
 
-![repro124m](assets/gpt2_124M_loss.png)
-
-Because the code is so simple, it is very easy to hack to your needs, train new models from scratch, or finetune pretrained checkpoints (e.g. biggest one currently available as a starting point would be the GPT-2 1.3B model from OpenAI).
+Our objective with intropix is to try and build an architecture that takes into account the distributional information, both at training and test time. 
 
 ## install
 
