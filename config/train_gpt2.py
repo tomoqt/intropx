@@ -11,6 +11,7 @@ wandb_run_name='gpt2-124M'
 batch_size = 12
 block_size = 1024
 gradient_accumulation_steps = 5 * 8
+concat_embeddings = True
 
 # this makes total number of tokens be 300B
 max_iters = 50000

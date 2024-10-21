@@ -105,7 +105,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    d_hidden: int = 128  # Hidden size for the MLP processing distributions
+    d_hidden: int = 384  # Hidden size for the MLP processing distributions
+    concat_embeddings: bool = False  # New flag to toggle embedding concatenation
 
 class GPT(nn.Module):
 
@@ -116,7 +117,7 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd // 2) if config.concat_embeddings else nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
@@ -131,11 +132,11 @@ class GPT(nn.Module):
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
-        # Distribution MLP
+        # Conditional Distribution MLP Initialization
         self.dist_mlp = nn.Sequential(
             nn.Linear(config.vocab_size, config.d_hidden),
             nn.ReLU(),
-            nn.Linear(config.d_hidden, config.n_embd)
+            nn.Linear(config.d_hidden, config.n_embd // 2) if config.concat_embeddings else nn.Linear(config.d_hidden, config.n_embd),
         )
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -178,7 +179,11 @@ class GPT(nn.Module):
         dist_emb = self.dist_mlp(distributions)  # Shape: (b, t, n_embd)
 
         # Combine embeddings
-        x = tok_emb + pos_emb + dist_emb  # Shape: (b, t, n_embd)
+        if self.config.concat_embeddings:
+            x = torch.cat([tok_emb, dist_emb], dim=-1)  # Concatenate half-dimension embeddings
+            x = x + pos_emb  # Add positional embeddings after concatenation
+        else:
+            x = tok_emb + pos_emb + dist_emb  # Sum embeddings as before
 
         # Apply dropout
         x = self.transformer.drop(x)
@@ -281,3 +286,7 @@ class GPT(nn.Module):
         flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
+
+
+
+
