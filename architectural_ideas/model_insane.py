@@ -108,13 +108,14 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    vocab_size: int = 50304
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    num_orbits: int = 5  # New parameter for number of orbits
+    bias: bool = True
+    num_additional_layers: int = 1
+    apply_softmax: bool = True  # New option to control softmax application
 
 class GPT(nn.Module):
 
@@ -132,6 +133,22 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+        # Create a sequence of additional layers with normalization
+        layers = []
+        for _ in range(config.num_additional_layers - 1):
+            layers.append(nn.Linear(config.vocab_size, config.vocab_size))
+            layers.append(nn.GELU())
+            layers.append(LayerNorm(config.vocab_size, bias=config.bias))  # Add LayerNorm
+
+        layers.append(nn.Linear(config.vocab_size, config.vocab_size))
+        
+        # Conditionally add softmax based on configuration
+        if config.apply_softmax:
+            layers.append(nn.Softmax(dim=-1))
+
+        self.additional_layers = nn.Sequential(*layers)
+
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
@@ -147,23 +164,6 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
-
-        # Precompute orbit points
-        t_values = torch.linspace(0.01, 0.99, steps=100)
-        n_values = torch.arange(1, config.num_orbits + 1, dtype=torch.float32)
-        
-        # Compute orbit points (t_values: (100,1), n_values: (1,num_orbits))
-        t = t_values.unsqueeze(-1)  # (100,1)
-        n = n_values.unsqueeze(0)   # (1,num_orbits)
-        
-        u = t * torch.log(t) + (1 - t) * torch.log((1 - t) / n)
-        entropy_orbits = -u  # Shape: (100, num_orbits)
-        v = t * (torch.log(t) - u) ** 2 + (1 - t) * (torch.log((1 - t) / n) - u) ** 2
-        varentropy_orbits = v  # Shape: (100, num_orbits)
-        
-        # Flatten and store as buffers
-        self.register_buffer('entropy_orbits', entropy_orbits.view(-1))      # (100 * num_orbits,)
-        self.register_buffer('varentropy_orbits', varentropy_orbits.view(-1)) # (100 * num_orbits,)
 
     def get_num_params(self, non_embedding=True):
         """
@@ -185,59 +185,36 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def compute_orbit_distance(self, entropy, varentropy):
-        """
-        Compute the minimum distance from (entropy, varentropy) to any orbit.
-        """
-        # Expand dimensions for broadcasting
-        entropy = entropy.unsqueeze(-1)      # Shape: (B, T, 1)
-        varentropy = varentropy.unsqueeze(-1) # Shape: (B, T, 1)
-
-        # Compute distances using pre-computed orbit points
-        distances = (entropy - self.entropy_orbits) ** 2 + \
-                   (varentropy - self.varentropy_orbits) ** 2  # Shape: (B, T, 100 * num_orbits)
-
-        # Get minimum distance
-        min_distance, _ = distances.min(dim=-1)  # Shape: (B, T)
-        return min_distance
-
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
-        # Regular forward pass
-        tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
-        # Compute logits and probabilities
-        logits = self.lm_head(x)
-        probs = F.softmax(logits, dim=-1) + 1e-8  # Add small epsilon to avoid log(0)
-
-        # Compute entropy and varentropy
-        log_probs = torch.log(probs)
-        entropy = -torch.sum(probs * log_probs, dim=-1)
-        mean_log_probs = torch.sum(probs * log_probs, dim=-1, keepdim=True)
-        varentropy = torch.sum(probs * (log_probs - mean_log_probs) ** 2, dim=-1)
-
-        # Compute orbit distance and auxiliary loss
-        orbit_distance = self.compute_orbit_distance(entropy, varentropy)
-        auxiliary_loss = orbit_distance.mean()
-
         if targets is not None:
-            # Combine main loss with auxiliary loss
-            main_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            loss = main_loss + auxiliary_loss
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            
+            # Pass through the additional layers (softmax applied here)
+            token_logits = self.additional_layers(logits)
+            
+            # Calculate loss using the output of the additional layers
+            loss = F.cross_entropy(token_logits.view(-1, token_logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :])
+            token_logits = self.additional_layers(logits)
             loss = None
 
-        return logits, loss
+        return token_logits, loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -375,4 +352,5 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
 

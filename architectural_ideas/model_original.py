@@ -114,7 +114,6 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    num_orbits: int = 5  # New parameter for number of orbits
 
 class GPT(nn.Module):
 
@@ -148,23 +147,6 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
-        # Precompute orbit points
-        t_values = torch.linspace(0.01, 0.99, steps=100)
-        n_values = torch.arange(1, config.num_orbits + 1, dtype=torch.float32)
-        
-        # Compute orbit points (t_values: (100,1), n_values: (1,num_orbits))
-        t = t_values.unsqueeze(-1)  # (100,1)
-        n = n_values.unsqueeze(0)   # (1,num_orbits)
-        
-        u = t * torch.log(t) + (1 - t) * torch.log((1 - t) / n)
-        entropy_orbits = -u  # Shape: (100, num_orbits)
-        v = t * (torch.log(t) - u) ** 2 + (1 - t) * (torch.log((1 - t) / n) - u) ** 2
-        varentropy_orbits = v  # Shape: (100, num_orbits)
-        
-        # Flatten and store as buffers
-        self.register_buffer('entropy_orbits', entropy_orbits.view(-1))      # (100 * num_orbits,)
-        self.register_buffer('varentropy_orbits', varentropy_orbits.view(-1)) # (100 * num_orbits,)
-
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
@@ -185,56 +167,27 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def compute_orbit_distance(self, entropy, varentropy):
-        """
-        Compute the minimum distance from (entropy, varentropy) to any orbit.
-        """
-        # Expand dimensions for broadcasting
-        entropy = entropy.unsqueeze(-1)      # Shape: (B, T, 1)
-        varentropy = varentropy.unsqueeze(-1) # Shape: (B, T, 1)
-
-        # Compute distances using pre-computed orbit points
-        distances = (entropy - self.entropy_orbits) ** 2 + \
-                   (varentropy - self.varentropy_orbits) ** 2  # Shape: (B, T, 100 * num_orbits)
-
-        # Get minimum distance
-        min_distance, _ = distances.min(dim=-1)  # Shape: (B, T)
-        return min_distance
-
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
-        # Regular forward pass
-        tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
-        # Compute logits and probabilities
-        logits = self.lm_head(x)
-        probs = F.softmax(logits, dim=-1) + 1e-8  # Add small epsilon to avoid log(0)
-
-        # Compute entropy and varentropy
-        log_probs = torch.log(probs)
-        entropy = -torch.sum(probs * log_probs, dim=-1)
-        mean_log_probs = torch.sum(probs * log_probs, dim=-1, keepdim=True)
-        varentropy = torch.sum(probs * (log_probs - mean_log_probs) ** 2, dim=-1)
-
-        # Compute orbit distance and auxiliary loss
-        orbit_distance = self.compute_orbit_distance(entropy, varentropy)
-        auxiliary_loss = orbit_distance.mean()
-
         if targets is not None:
-            # Combine main loss with auxiliary loss
-            main_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            loss = main_loss + auxiliary_loss
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            logits = self.lm_head(x[:, [-1], :])
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
@@ -375,4 +328,3 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
-
