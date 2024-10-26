@@ -228,16 +228,23 @@ class GPT(nn.Module):
         # Compute orbit distance and auxiliary loss
         orbit_distance = self.compute_orbit_distance(entropy, varentropy)
         auxiliary_loss = orbit_distance.mean()
-
+        
+        # Store tensor values without detaching/converting to item
+        self.auxiliary_loss_tensor = auxiliary_loss
+        
         if targets is not None:
-            # Combine main loss with auxiliary loss
-            main_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            loss = main_loss + auxiliary_loss
+            # Keep original loss separate for logging
+            original_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # Store tensor values
+            self.total_loss_tensor = original_loss + auxiliary_loss
+            self.original_loss_tensor = original_loss
+            # Return both losses for the training loop
+            return logits, (original_loss, auxiliary_loss)
         else:
             logits = self.lm_head(x[:, [-1], :])
-            loss = None
-
-        return logits, loss
+            self.total_loss_tensor = None
+            self.original_loss_tensor = None
+            return logits, None
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -329,7 +336,7 @@ class GPT(nn.Module):
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused} with original nanoGPT")
+        print(f"using fused AdamW: {use_fused} with original orbits")
 
         return optimizer
 
@@ -375,4 +382,9 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+
+
+
+
 
