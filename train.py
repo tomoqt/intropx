@@ -238,11 +238,10 @@ def estimate_loss():
                 output = model(X, Y)
                 # Check if the output is a tuple and extract loss
                 if isinstance(output, tuple):
-                    logits, (original_loss, _) = output  # We use original_loss for evaluation
-                    losses[k] = original_loss.item()
+                    loss = output[-1]  # Assume loss is the last element
                 else:
                     loss = output  # If it's not a tuple, assume it's just the loss
-                    losses[k] = loss.item()
+            losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
@@ -319,8 +318,7 @@ while True:
         with ctx:
             output = model(X, Y)
             if isinstance(output, tuple):
-                logits, (original_loss, auxiliary_loss) = output
-                loss = original_loss + auxiliary_loss  # Use combined loss for training
+                loss = output[-1]  # Assume loss is the last element
             else:
                 loss = output  # If it's not a tuple, assume it's just the loss
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
@@ -343,25 +341,13 @@ while True:
     dt = t1 - t0
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
-        # get loss as float, but do it all at once to minimize graph breaks
-        if hasattr(raw_model, 'auxiliary_loss_tensor'):
-            with torch.no_grad():
-                aux_loss = raw_model.auxiliary_loss_tensor.item()
-                orig_loss = raw_model.original_loss_tensor.item()
-                total_loss = raw_model.total_loss_tensor.item()
-                print(f"iter {iter_num}: loss {loss.item():.4f}, aux_loss {aux_loss:.4f}, "
-                      f"orig_loss {orig_loss:.4f}, total_loss {total_loss:.4f}, "
-                      f"time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-                
-                if wandb_log:
-                    wandb.log({
-                        "auxiliary_loss": aux_loss,
-                        "original_loss": orig_loss,
-                        "total_loss": total_loss
-                    })
-        else:
-            print(f"iter {iter_num}: loss {loss.item():.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-
+        # get loss as float. note: this is a CPU-GPU sync point
+        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+        lossf = loss.item() * gradient_accumulation_steps
+        if local_iter_num >= 5: # let the training loop settle a bit
+            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
 
