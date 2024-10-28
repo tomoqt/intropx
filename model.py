@@ -150,11 +150,7 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.transformer.wte.weight = self.lm_head.weight
 
         # init all weights
         self.apply(self._init_weights)
@@ -169,20 +165,23 @@ class GPT(nn.Module):
         # Update moments initialization
         self.use_fractional_moments = config.use_fractional_moments
         if self.use_fractional_moments:
-            self.moment_powers = torch.linspace(
+            self.register_buffer("moment_powers", torch.linspace(
                 config.moment_range_start,
                 config.moment_range_end,
                 config.n_moments
-            )
+            ))
         else:
             self.n_moments = 6  # default integer moments
-        
+
         n_moments_total = config.n_moments if self.use_fractional_moments else self.n_moments
         self.moments_proj = MomentsFFN(n_moments_total, config.vocab_size)
         
         # Add learnable parameters for weighing logits and moments_logits
         self.logits_weight = nn.Parameter(torch.ones(1))
         self.moments_weight = nn.Parameter(torch.ones(1))
+
+        # Register log_vocab_size as a buffer
+        self.register_buffer("log_vocab_size", torch.log(torch.tensor(config.vocab_size, dtype=torch.float32)))
 
     def get_num_params(self, non_embedding=True):
         """
@@ -208,23 +207,73 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)  # Shape: (t)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        # Forward the GPT model
+        tok_emb = self.transformer.wte(idx)  # Shape: (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos)  # Shape: (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            # Compute logits
+            logits = self.lm_head(x)  # Shape: (b, t, vocab_size)
+
+            # Select top k tokens
+            top_k = 300
+            logits_topk, _ = torch.topk(logits, k=top_k, dim=-1)  # Shapes: (b, t, k), (_)
+
+            # Compute negative log probabilities over top k tokens
+            neg_log_probs_topk = -F.log_softmax(logits_topk, dim=-1)  # Shape: (b, t, k)
+
+            # Vectorized computation of moments
+            neg_log_probs_expanded = neg_log_probs_topk.unsqueeze(-1)  # Shape: (b, t, k, 1)
+            moment_powers_expanded = self.moment_powers.view(1, 1, 1, -1)  # Shape: (1, 1, 1, n_moments)
+            powered = neg_log_probs_expanded.pow(moment_powers_expanded)  # Shape: (b, t, k, n_moments)
+            moments = powered.mean(dim=2)  # Mean over k tokens, Shape: (b, t, n_moments)
+
+            # Apply min-max scaling across moments
+            moments_min = moments.min(dim=-1, keepdim=True)[0]
+            moments_max = moments.max(dim=-1, keepdim=True)[0]
+            moments = (moments - moments_min) / (moments_max - moments_min + 1e-8)
+
+            # Project moments to vocabulary space
+            moments_logits = self.moments_proj(moments)  # Shape: (b, t, vocab_size)
+
+            # Combine original logits with moments contribution
+            logits = self.logits_weight * logits + self.moments_weight * moments_logits
+
+            # Compute loss
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            # Inference-time: compute moments for the last position
+            logits = self.lm_head(x[:, [-1], :])  # Shape: (b, 1, vocab_size)
+
+            # Select top k tokens
+            top_k = 300
+            logits_topk, _ = torch.topk(logits, k=top_k, dim=-1)  # Shapes: (b, 1, k)
+
+            # Compute negative log probabilities over top k tokens
+            neg_log_probs_topk = -F.log_softmax(logits_topk, dim=-1)  # Shape: (b, 1, k)
+
+            # Vectorized computation of moments
+            neg_log_probs_expanded = neg_log_probs_topk.unsqueeze(-1)  # Shape: (b, 1, k, 1)
+            moment_powers_expanded = self.moment_powers.view(1, 1, 1, -1)  # Shape: (1, 1, 1, n_moments)
+            powered = neg_log_probs_expanded.pow(moment_powers_expanded)  # Shape: (b, 1, k, n_moments)
+            moments = powered.mean(dim=2)  # Mean over k tokens, Shape: (b, 1, n_moments)
+
+            # Apply min-max scaling across moments
+            moments_min = moments.min(dim=-1, keepdim=True)[0]
+            moments_max = moments.max(dim=-1, keepdim=True)[0]
+            moments = (moments - moments_min) / (moments_max - moments_min + 1e-8)
+
+            # Project moments to vocabulary space
+            moments_logits = self.moments_proj(moments)  # Shape: (b, 1, vocab_size)
+
+            # Combine original logits with moments contribution
+            logits = self.logits_weight * logits + self.moments_weight * moments_logits
             loss = None
 
         return logits, loss
@@ -341,68 +390,54 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """
-        Enhanced generation incorporating normalized integer or fractional moments of negative log probabilities.
-        """
-        # Calculate normalization factor based on vocab size as a tensor on the correct device
-        log_vocab_size = torch.log(torch.tensor(self.config.vocab_size, dtype=torch.float, device=idx.device))  # {{ edit_1 }}
-        
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            
-            # forward the model to get the logits for the index in the sequence
+
+            # Compute logits
             logits, _ = self(idx_cond)
-            # pluck the logits at the final step
-            logits = logits[:, -1, :]
-            
-            # Calculate negative log probabilities
-            neg_log_probs = -F.log_softmax(logits, dim=-1)
-            
-            # Calculate moments
-            moments = []
-            mean = torch.mean(neg_log_probs, dim=-1, keepdim=True)
-            moments.append(mean.squeeze())
-            
-            centered = neg_log_probs - mean  # Corrected: Do not multiply by log_vocab_size
-            
-            if self.use_fractional_moments:
-                # Calculate normalized fractional moments
-                for power in self.moment_powers[1:]:  # Skip power 1 as we already have mean
-                    moment_k = torch.mean(torch.abs(centered).pow(power), dim=-1) / (log_vocab_size ** power)  # {{ edit_2 }}
-                    moments.append(moment_k)
-            else:
-                # Calculate normalized integer moments
-                for k in range(2, self.n_moments + 1):
-                    moment_k = torch.mean(torch.pow(centered, k), dim=-1) / (log_vocab_size ** k)  # {{ edit_3 }}
-                    moments.append(moment_k)
-            
-            # Stack moments into a vector
-            moments = torch.stack(moments, dim=-1)
-            
+            logits = logits[:, -1, :]  # Shape: (batch_size, vocab_size)
+
+            # Select top k tokens
+            top_k_value = 300
+            logits_topk, _ = torch.topk(logits, k=top_k_value, dim=-1)  # Shapes: (b, k), (_)
+
+            # Compute negative log probabilities over top k tokens
+            neg_log_probs_topk = -F.log_softmax(logits_topk, dim=-1)  # Shape: (b, k)
+
+            # Vectorized computation of moments
+            neg_log_probs_expanded = neg_log_probs_topk.unsqueeze(-1)  # Shape: (b, k, 1)
+            moment_powers_expanded = self.moment_powers.view(1, 1, -1)  # Shape: (1, 1, n_moments)
+            powered = neg_log_probs_expanded.pow(moment_powers_expanded)  # Shape: (b, k, n_moments)
+            moments = powered.mean(dim=1)  # Mean over k tokens, Shape: (b, n_moments)
+
+            # Apply min-max scaling across moments
+            moments_min = moments.min(dim=-1, keepdim=True)[0]
+            moments_max = moments.max(dim=-1, keepdim=True)[0]
+            moments = (moments - moments_min) / (moments_max - moments_min + 1e-8)
+
             # Project moments to vocabulary space
-            moments_logits = self.moments_proj(moments)
-            
+            moments_logits = self.moments_proj(moments)  # Shape: (b, vocab_size)
+
             # Combine original logits with moments contribution
-            logits = self.logits_weight * logits + self.moments_weight * moments_logits  # {{ edit_4 }}
-            
+            logits = self.logits_weight * logits + self.moments_weight * moments_logits
+
             # Apply temperature
             logits = logits / temperature
-            
-            # optionally crop the logits to only the top k options
+
+            # Optionally apply top_k filtering
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-            
-            # apply softmax to convert logits to (normalized) probabilities
+
+            # Compute probabilities and sample
             probs = F.softmax(logits, dim=-1)
-            
-            # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
-            
-            # append sampled index to the running sequence and continue
+
+            # Append sampled index to the sequence
             idx = torch.cat((idx, idx_next), dim=1)
-    
+
         return idx
+
+
 
 
