@@ -129,8 +129,8 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     # Add new config parameters for moments
-    use_fractional_moments: bool = False
-    moment_range_start: float = 1.0
+    use_fractional_moments: bool = True
+    moment_range_start: float = 0.5
     moment_range_end: float = 6.0
     n_moments: int = 128
 
@@ -342,8 +342,11 @@ class GPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
-        Enhanced generation incorporating integer or fractional moments of negative log probabilities.
+        Enhanced generation incorporating normalized integer or fractional moments of negative log probabilities.
         """
+        # Calculate normalization factor based on vocab size
+        log_vocab_size = math.log(self.config.vocab_size)
+        
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
@@ -361,17 +364,17 @@ class GPT(nn.Module):
             mean = torch.mean(neg_log_probs, dim=-1, keepdim=True)
             moments.append(mean.squeeze())
             
-            centered = neg_log_probs - mean
+            centered = neg_log_probs - mean  # Corrected: Do not multiply by log_vocab_size
             
             if self.use_fractional_moments:
-                # Calculate fractional moments
+                # Calculate normalized fractional moments
                 for power in self.moment_powers[1:]:  # Skip power 1 as we already have mean
-                    moment_k = torch.mean(torch.abs(centered).pow(power), dim=-1)
+                    moment_k = torch.mean(torch.abs(centered).pow(power), dim=-1) / (log_vocab_size ** power)
                     moments.append(moment_k)
             else:
-                # Calculate integer moments
+                # Calculate normalized integer moments
                 for k in range(2, self.n_moments + 1):
-                    moment_k = torch.mean(torch.pow(centered, k), dim=-1)
+                    moment_k = torch.mean(torch.pow(centered, k), dim=-1) / (log_vocab_size ** k)
                     moments.append(moment_k)
             
             # Stack moments into a vector
@@ -381,7 +384,7 @@ class GPT(nn.Module):
             moments_logits = self.moments_proj(moments)
             
             # Combine original logits with moments contribution
-            logits = self.logits_weight * logits + self.moments_weight * moments_logits
+            logits = self.logits_weight * logits + self.moments_weight * moments_logits  # {{ edit_1 }}
             
             # Apply temperature
             logits = logits / temperature
@@ -399,6 +402,6 @@ class GPT(nn.Module):
             
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
-
+    
         return idx
 
