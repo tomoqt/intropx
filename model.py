@@ -344,8 +344,8 @@ class GPT(nn.Module):
         """
         Enhanced generation incorporating normalized integer or fractional moments of negative log probabilities.
         """
-        # Calculate normalization factor based on vocab size
-        log_vocab_size = math.log(self.config.vocab_size)
+        # Calculate normalization factor based on vocab size as a tensor on the correct device
+        log_vocab_size = torch.log(torch.tensor(self.config.vocab_size, dtype=torch.float, device=idx.device))  # {{ edit_1 }}
         
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
@@ -369,12 +369,12 @@ class GPT(nn.Module):
             if self.use_fractional_moments:
                 # Calculate normalized fractional moments
                 for power in self.moment_powers[1:]:  # Skip power 1 as we already have mean
-                    moment_k = torch.mean(torch.abs(centered).pow(power), dim=-1) / (log_vocab_size ** power)
+                    moment_k = torch.mean(torch.abs(centered).pow(power), dim=-1) / (log_vocab_size ** power)  # {{ edit_2 }}
                     moments.append(moment_k)
             else:
                 # Calculate normalized integer moments
                 for k in range(2, self.n_moments + 1):
-                    moment_k = torch.mean(torch.pow(centered, k), dim=-1) / (log_vocab_size ** k)
+                    moment_k = torch.mean(torch.pow(centered, k), dim=-1) / (log_vocab_size ** k)  # {{ edit_3 }}
                     moments.append(moment_k)
             
             # Stack moments into a vector
@@ -384,7 +384,7 @@ class GPT(nn.Module):
             moments_logits = self.moments_proj(moments)
             
             # Combine original logits with moments contribution
-            logits = self.logits_weight * logits + self.moments_weight * moments_logits  # {{ edit_1 }}
+            logits = self.logits_weight * logits + self.moments_weight * moments_logits  # {{ edit_4 }}
             
             # Apply temperature
             logits = logits / temperature
@@ -404,4 +404,5 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
     
         return idx
+
 
