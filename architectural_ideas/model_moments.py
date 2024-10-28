@@ -129,8 +129,8 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     # Add new config parameters for moments
-    use_fractional_moments: bool = False
-    moment_range_start: float = 1.0
+    use_fractional_moments: bool = True
+    moment_range_start: float = 0.5
     moment_range_end: float = 6.0
     n_moments: int = 128
 

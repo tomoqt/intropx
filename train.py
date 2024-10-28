@@ -29,6 +29,9 @@ from torch.distributed import init_process_group, destroy_process_group
 
 import importlib
 
+# Add near the top of the file, after other imports
+import wandb
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -62,7 +65,8 @@ beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
-decay_lr = True # whether to decay the learning rate
+decay_lr = False # whether to decay the learning rate
+constant_lr = True  # if True, use constant learning rate without warmup or decay
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
@@ -172,7 +176,8 @@ if init_from == 'scratch':
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_filename = 'ckpt_old.pt' if use_old_model else 'ckpt.pt'
+    ckpt_path = os.path.join(out_dir, ckpt_filename)
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
@@ -263,7 +268,20 @@ def get_lr(it):
 # logging
 if wandb_log and master_process:
     import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    if os.environ.get('WANDB_SWEEP_ID'):
+        # We're in a sweep, so initialize without a specific run name
+        wandb.init(project=wandb_project, config=config)
+        # Update the config with wandb's sweep configuration
+        sweep_config = wandb.config
+        for key in ['batch_size', 'learning_rate', 'n_layer', 'n_head', 'n_embd']:
+            if hasattr(sweep_config, key):
+                globals()[key] = sweep_config[key]
+                config[key] = sweep_config[key]
+        # Reinitialize model args with new config
+        model_args.update(dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd))
+    else:
+        # Normal run, not a sweep
+        wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -271,10 +289,16 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+nan_counter = 0  # Counter for consecutive NaN losses
+max_nan_tolerance = 3  # Maximum number of consecutive NaN losses before stopping
+
 while True:
 
     # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
+    if constant_lr:
+        lr = learning_rate  # Use constant learning rate
+    else:
+        lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -301,8 +325,11 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                # Choose checkpoint filename based on model version
+                ckpt_filename = 'ckpt_old.pt' if use_old_model else 'ckpt.pt'
+                ckpt_path = os.path.join(out_dir, ckpt_filename)
+                print(f"saving checkpoint to {ckpt_path}")
+                torch.save(checkpoint, ckpt_path)
     if iter_num == 0 and eval_only:
         break
 
@@ -322,6 +349,22 @@ while True:
             else:
                 loss = output  # If it's not a tuple, assume it's just the loss
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+
+        # Check for NaN loss
+        if torch.isnan(loss).any():
+            nan_counter += 1
+            print(f"WARNING: NaN loss detected ({nan_counter}/{max_nan_tolerance})")
+            if nan_counter >= max_nan_tolerance:
+                print(f"ERROR: NaN loss detected {max_nan_tolerance} times. Terminating training.")
+                if wandb_log and master_process:
+                    wandb.run.summary['terminated_reason'] = 'nan_loss'
+                    wandb.finish()
+                if ddp:
+                    destroy_process_group()
+                sys.exit(1)  # Exit with error code
+        else:
+            nan_counter = 0  # Reset counter if loss is not NaN
+
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16

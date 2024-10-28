@@ -1,10 +1,14 @@
 source venv/bin/activate
 python sample.py --out_dir=out-shakespeare-char
+python sample.py --out
 python train.py config/train_shakespeare_char.py
+python train.py config/train_shakespeare.py
 
 --use_old_model=True
 git clone https://github.com/tomoqt/intropx.git
 pip install -r requirements.txt
 python data/openwebtext/prepare.py
+python data/tiny-textbooks/prepare.py
+
 torchrun --standalone --nproc_per_node=8 train.py config/train_gpt2.py 
 torchrun --standalone --nproc_per_node=1 train.py config/train_gpt2.py 

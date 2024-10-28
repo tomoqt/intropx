@@ -1,12 +1,3 @@
-"""
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
-"""
-
 import math
 import inspect
 from dataclasses import dataclass
@@ -41,38 +32,32 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+        self.flash = False  # Disable flash attention to compute attention scores
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                    .view(1, 1, config.block_size, config.block_size))
+        self.att_scores = None  # Initialize att_scores
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # calculate query, key, values for all heads and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # causal self-attention
+        att_scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att_scores = att_scores.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att_scores, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
+        self.att_scores = att_scores  # Save attention scores
         return y
 
 class MLP(nn.Module):
@@ -90,20 +75,6 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
-
-class MomentsFFN(nn.Module):
-    """Projects moments statistics to vocabulary space"""
-    
-    def __init__(self, n_moments, vocab_size):
-        super().__init__()
-        self.n_moments = n_moments
-        self.proj = nn.Sequential(
-            nn.Linear(n_moments, vocab_size),
-            nn.Tanh()  # bound the contribution
-        )
-    
-    def forward(self, moments):
-        return self.proj(moments)
 
 class Block(nn.Module):
 
@@ -128,11 +99,6 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    # Add new config parameters for moments
-    use_fractional_moments: bool = False
-    moment_range_start: float = 1.0
-    moment_range_end: float = 6.0
-    n_moments: int = 128
 
 class GPT(nn.Module):
 
@@ -150,11 +116,7 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.transformer.wte.weight = self.lm_head.weight # weight tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -165,24 +127,6 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
-
-        # Update moments initialization
-        self.use_fractional_moments = config.use_fractional_moments
-        if self.use_fractional_moments:
-            self.moment_powers = torch.linspace(
-                config.moment_range_start,
-                config.moment_range_end,
-                config.n_moments
-            )
-        else:
-            self.n_moments = 6  # default integer moments
-        
-        n_moments_total = config.n_moments if self.use_fractional_moments else self.n_moments
-        self.moments_proj = MomentsFFN(n_moments_total, config.vocab_size)
-        
-        # Add learnable parameters for weighing logits and moments_logits
-        self.logits_weight = nn.Parameter(torch.ones(1))
-        self.moments_weight = nn.Parameter(torch.ones(1))
 
     def get_num_params(self, non_embedding=True):
         """
@@ -218,16 +162,44 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+        # compute logits
+        logits = self.lm_head(x)
 
-        return logits, loss
+        # compute regular loss
+        if targets is not None:
+            regular_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            regular_loss = None
+
+        # compute attention energies
+        att_energy = 0
+        for block in self.transformer.h:
+            att_scores = block.attn.att_scores  # shape (B, nh, T, T)
+            B, nh, T, _ = att_scores.shape
+            att_scores_reshaped = att_scores.reshape(B * nh * T, T)
+            att_logsumexp = torch.logsumexp(att_scores_reshaped, dim=-1)  # shape (B*nh*T,)
+            att_logsumexp = att_logsumexp.view(B, nh, T)
+            # Average over sequence length
+            att_energy_layer = att_logsumexp.mean(dim=-1)  # shape (B, nh)
+            # Sum of norms of these vectors
+            att_energy_layer_norm = att_energy_layer.norm(p=2, dim=-1)  # shape (B,)
+            # Sum over batch
+            att_energy += att_energy_layer_norm.sum()
+
+        # compute logits energy
+        logits_logsumexp = torch.logsumexp(logits, dim=-1)  # shape (B, T)
+        logits_energy = logits_logsumexp.mean()
+
+        # total additional loss
+        additional_loss = att_energy + logits_energy
+
+        # total loss
+        if targets is not None:
+            total_loss = regular_loss + additional_loss
+        else:
+            total_loss = None
+
+        return logits, total_loss, regular_loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -342,63 +314,26 @@ class GPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
-        Enhanced generation incorporating integer or fractional moments of negative log probabilities.
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step
-            logits = logits[:, -1, :]
-            
-            # Calculate negative log probabilities
-            neg_log_probs = -F.log_softmax(logits, dim=-1)
-            
-            # Calculate moments
-            moments = []
-            mean = torch.mean(neg_log_probs, dim=-1, keepdim=True)
-            moments.append(mean.squeeze())
-            
-            centered = neg_log_probs - mean
-            
-            if self.use_fractional_moments:
-                # Calculate fractional moments
-                for power in self.moment_powers[1:]:  # Skip power 1 as we already have mean
-                    moment_k = torch.mean(torch.abs(centered).pow(power), dim=-1)
-                    moments.append(moment_k)
-            else:
-                # Calculate integer moments
-                for k in range(2, self.n_moments + 1):
-                    moment_k = torch.mean(torch.pow(centered, k), dim=-1)
-                    moments.append(moment_k)
-            
-            # Stack moments into a vector
-            moments = torch.stack(moments, dim=-1)
-            
-            # Project moments to vocabulary space
-            moments_logits = self.moments_proj(moments)
-            
-            # Combine original logits with moments contribution
-            logits = self.logits_weight * logits + self.moments_weight * moments_logits
-            
-            # Apply temperature
-            logits = logits / temperature
-            
+            logits, _, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-            
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
-            
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
-            
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
-

@@ -19,7 +19,7 @@ top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 p
 seed = 1337
 device = 'cpu' # default to CPU to avoid CUDA issues
 dtype = 'float32' # default to float32 to avoid potential issues with other dtypes
-compile = False # use PyTorch 2.0 to compile the model to be faster
+compile = True # use PyTorch 2.0 to compile the model to be faster
 
 # Try to load configurator.py, but continue if it's not found
 config_file = 'configurator.py'

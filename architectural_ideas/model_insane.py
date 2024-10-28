@@ -124,6 +124,9 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
+        
+        # Define bottleneck dimension
+        self.bottleneck_dim = 128
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -134,20 +137,26 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
-        # Create a sequence of additional layers with normalization
-        layers = []
-        for _ in range(config.num_additional_layers - 1):
-            layers.append(nn.Linear(config.vocab_size, config.vocab_size))
-            layers.append(nn.GELU())
-            layers.append(LayerNorm(config.vocab_size, bias=config.bias))  # Add LayerNorm
-
-        layers.append(nn.Linear(config.vocab_size, config.vocab_size))
+        # Process logits through bottleneck layers
+        self.down_proj = nn.Linear(config.vocab_size, self.bottleneck_dim)
+        self.ln_down = LayerNorm(self.bottleneck_dim, bias=config.bias)
         
-        # Conditionally add softmax based on configuration
+        # Simple FFN middle layers
+        self.middle_layers = nn.ModuleList([
+            nn.Linear(self.bottleneck_dim, self.bottleneck_dim)
+            for _ in range(config.num_additional_layers - 2)
+        ])
+        
+        # Project directly back to vocab_size
+        self.up_proj = nn.Linear(self.bottleneck_dim, config.vocab_size)
+        
+        # Final layer norm
+        self.ln_final = LayerNorm(config.vocab_size, bias=config.bias)
+        
         if config.apply_softmax:
-            layers.append(nn.Softmax(dim=-1))
-
-        self.additional_layers = nn.Sequential(*layers)
+            self.output_softmax = nn.Softmax(dim=-1)
+        else:
+            self.output_softmax = nn.Identity()
 
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -189,29 +198,47 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
+            # Get original logits
             logits = self.lm_head(x)
             
-            # Pass through the additional layers (softmax applied here)
-            token_logits = self.additional_layers(logits)
+            # Process through bottleneck layers
+            bottleneck = self.ln_down(self.down_proj(logits))
             
-            # Calculate loss using the output of the additional layers
+            # Process through middle FFN layers
+            for layer in self.middle_layers:
+                bottleneck = layer(bottleneck)
+            
+            # Project back to vocab size and apply final processing
+            processed = self.up_proj(bottleneck)
+            token_logits = self.ln_final(processed + logits)  # Add residual connection
+            
+            # Apply softmax if configured
+            token_logits = self.output_softmax(token_logits)
+            
             loss = F.cross_entropy(token_logits.view(-1, token_logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :])
-            token_logits = self.additional_layers(logits)
+            x = x[:, [-1], :]
+            logits = self.lm_head(x)
+            
+            bottleneck = self.ln_down(self.down_proj(logits))
+            for layer in self.middle_layers:
+                bottleneck = layer(bottleneck)
+            
+            processed = self.up_proj(bottleneck)
+            token_logits = self.ln_final(processed + logits)  # Add residual connection
+            token_logits = self.output_softmax(token_logits)
             loss = None
 
         return token_logits, loss
@@ -352,5 +379,13 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+
+
+
+
+
+
+
 
 
