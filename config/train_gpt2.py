@@ -8,7 +8,11 @@ wandb_run_name='gpt2-124M'
 
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
-batch_size = 12
+batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+# model
+n_layer = 24
+n_head = 16
+n_embd = 1024
 block_size = 1024
 gradient_accumulation_steps = 5 * 8
 concat_embeddings = True
@@ -18,7 +22,7 @@ max_iters = 50000
 lr_decay_iters = 50000
 
 # eval stuff
-eval_interval = 200
+eval_interval = 100
 eval_iters = 100
 log_interval = 10
 

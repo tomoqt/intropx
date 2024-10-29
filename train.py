@@ -65,8 +65,8 @@ beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
-decay_lr = False # whether to decay the learning rate
-constant_lr = True  # if True, use constant learning rate without warmup or decay
+decay_lr = True # whether to decay the learning rate
+constant_lr = False  # if True, use constant learning rate without warmup or decay
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla

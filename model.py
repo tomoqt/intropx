@@ -99,7 +99,7 @@ class MomentsFFN(nn.Module):
         self.n_moments = n_moments
         self.proj = nn.Sequential(
             nn.Linear(n_moments, vocab_size),
-            nn.Tanh()  # bound the contribution
+            nn.LeakyReLU()  # bound the contribution
         )
     
     def forward(self, moments):
