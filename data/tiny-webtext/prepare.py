@@ -20,7 +20,7 @@ enc = tiktoken.get_encoding("gpt2")
 
 if __name__ == '__main__':
     # takes 54GB in huggingface .cache dir, about 8M documents (8,013,769)
-    dataset = load_dataset("neuralwork/arxiver", num_proc=num_proc_load_dataset)
+    dataset = load_dataset("nampdn-ai/tiny-webtext", num_proc=num_proc_load_dataset)
 
     # owt by default only contains the 'train' split, so create a test split
     split_dataset = dataset["train"].train_test_split(test_size=0.0005, seed=2357, shuffle=True)
@@ -41,17 +41,16 @@ if __name__ == '__main__':
 
     # we now want to tokenize the dataset. first define the encoding function (gpt2 bpe)
     def process(example):
-        # Use only markdown content for training
-        text = example['markdown']
-        ids = enc.encode_ordinary(text)  # encode_ordinary ignores any special tokens
-        ids.append(enc.eot_token)  # add the end of text token, e.g. 50256 for gpt2 bpe
+        ids = enc.encode_ordinary(example['text']) # encode_ordinary ignores any special tokens
+        ids.append(enc.eot_token) # add the end of text token, e.g. 50256 for gpt2 bpe
+        # note: I think eot should be prepended not appended... hmm. it's called "eot" though...
         out = {'ids': ids, 'len': len(ids)}
         return out
 
     # tokenize the dataset
     tokenized = split_dataset.map(
         process,
-        remove_columns=['id', 'title', 'abstract', 'authors', 'published_date', 'link', 'markdown'],
+        remove_columns=['text'],
         desc="tokenizing the splits",
         num_proc=num_proc,
     )
@@ -62,7 +61,7 @@ if __name__ == '__main__':
         filename = os.path.join(os.path.dirname(__file__), f'{split}.bin')
         dtype = np.uint16 # (can do since enc.max_token_value == 50256 is < 2**16)
         arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
-        total_batches = min(1024, len(dset))  # Dynamically set total_batches
+        total_batches = 1024
 
         idx = 0
         for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):

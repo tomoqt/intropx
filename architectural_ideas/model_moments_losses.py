@@ -1,5 +1,17 @@
 """
-Full definition of a GPT Language Model, all of it in this single file.
+This is an implementation of a GPT language model that includes a novel loss function combining cross-entropy with moment matching.
+
+The key ideas are:
+1. Standard GPT architecture with transformer blocks, self-attention, and MLP layers
+2. Custom loss function that:
+   - Uses traditional cross-entropy loss for token prediction
+   - Adds a moment-matching component that compares statistical moments of the model's log probabilities
+   - Can use either integer or fractional moments via configuration
+   - Allows weighting between cross-entropy and moment losses
+3. Supports both training from scratch and loading pretrained GPT-2 weights
+
+The moment matching helps regularize the model's probability distributions and can potentially improve calibration.
+
 References:
 1) the official GPT-2 TensorFlow implementation released by OpenAI:
 https://github.com/openai/gpt-2/blob/master/src/model.py
@@ -8,16 +20,12 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 """
 
 import math
-import inspect
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
-import os
-import matplotlib.pyplot as plt
-import numpy as np
+import inspect
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -95,20 +103,6 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
-class MomentsFFN(nn.Module):
-    """Projects moments statistics to vocabulary space"""
-    
-    def __init__(self, n_moments, vocab_size):
-        super().__init__()
-        self.n_moments = n_moments
-        self.proj = nn.Sequential(
-            nn.Linear(n_moments, vocab_size),
-            nn.LeakyReLU()  # bound the contribution
-        )
-    
-    def forward(self, moments):
-        return self.proj(moments)
-
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -126,19 +120,30 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    # Add new config parameters for moments
-    use_fractional_moments: bool = True
-    moment_range_start: float = 1
-    moment_range_end: float = 15
-    n_moments: int = 256
-    plot_moments: bool = True  # New parameter
-    moments_plot_dir: str = 'moment_plots'  # New parameter
+    bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    # Custom loss configuration
+    use_custom_moments_loss: bool = True  # Whether to use the custom moment loss
+    use_fractional_moments: bool = False  # Whether to use fractional moments
+    moment_range_start: float = 1.0
+    moment_range_end: float = 4.0
+    moment_grid_size: int = 4  # Number of moments if using fractional moments
+    n_moments: int = 4  # Number of integer moments
+    moment_weight: float = 0.1  # Weight for the moment loss component
+
+    def __post_init__(self):
+        if self.use_fractional_moments:
+            self.moment_orders = torch.linspace(
+                self.moment_range_start,
+                self.moment_range_end,
+                self.moment_grid_size
+            )
+        else:
+            self.moment_orders = torch.arange(1, self.n_moments + 1, dtype=torch.float32)
 
 class GPT(nn.Module):
 
@@ -158,6 +163,9 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
 
+        # Define custom loss components
+        self.moment_weight = config.moment_weight
+
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -168,35 +176,6 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
-        # Update moments initialization
-        self.use_fractional_moments = config.use_fractional_moments
-        if self.use_fractional_moments:
-            # Register moment powers as buffer
-            self.register_buffer("moment_powers", torch.linspace(
-                config.moment_range_start,
-                config.moment_range_end,
-                config.n_moments
-            ))
-            
-            # Compute and register normalization constants
-            max_surprisal = torch.log(torch.tensor(config.vocab_size, dtype=torch.float32))
-            constants = max_surprisal.pow(self.moment_powers)
-            self.register_buffer("constants", constants.view(1, 1, -1))  # Shape: (1, 1, n_moments)
-        else:
-            self.n_moments = 6  # default integer moments
-
-        n_moments_total = config.n_moments if self.use_fractional_moments else self.n_moments
-        self.moments_proj = MomentsFFN(n_moments_total, config.vocab_size)
-        
-        # Add learnable parameters for weighing logits and moments_logits
-        self.logits_weight = nn.Parameter(torch.ones(1))
-        self.moments_weight = nn.Parameter(torch.ones(1))
-
-        # Register log_vocab_size as a buffer
-        self.register_buffer("log_vocab_size", torch.log(torch.tensor(config.vocab_size, dtype=torch.float32)))
-        # Compute normalization constants: n^{1/n} for each moment order n
-        norm_constants = self.moment_powers.pow(1 / self.moment_powers)
-        self.register_buffer('norm_constants', norm_constants)
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
@@ -224,109 +203,51 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         # Forward the GPT model
-        tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
+        tok_emb = self.transformer.wte(idx)  # (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos)  # (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
+        logits = self.lm_head(x)  # Shape: (b, t, vocab_size)
+
         if targets is not None:
-            # Compute logits
-            logits = self.lm_head(x)  # Shape: (b, t, vocab_size)
+            # Compute cross-entropy loss
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
-            # Select top k tokens
-            top_k = 300
-            logits_topk, indices = torch.topk(logits, k=top_k, dim=-1)
+            if self.config.use_custom_moments_loss:
+                # Compute log probabilities
+                log_probs = F.log_softmax(logits, dim=-1)  # Shape: (b, t, vocab_size)
 
-            # Compute probabilities over top k tokens
-            epsilon = 1e-10
-            probs_topk = F.softmax(logits_topk, dim=-1) + epsilon  # Shape: (b, t, k)
+                # Get log_probs at target indices
+                log_probs_flat = log_probs.view(-1, logits.size(-1))  # Shape: (b*t, vocab_size)
+                targets_flat = targets.view(-1, 1)  # Shape: (b*t, 1)
+                log_probs_at_targets = log_probs_flat.gather(1, targets_flat).squeeze()  # Shape: (b*t,)
 
-            # Compute surprisal (negative log probabilities)
-            surprisal_topk = -torch.log(probs_topk)  # Shape: (b, t, k)
+                # Compute moment losses
+                moment_losses = []
+                for k in self.config.moment_orders:
+                    k = k.item()  # Get the scalar value from the tensor
+                    # Compute the k-th moment
+                    moment_k = torch.mean((log_probs_at_targets.abs()) ** k) ** (1.0 / k)
+                    moment_losses.append(moment_k)
 
-            # Compute mean surprisal (entropy)
-            mean_surprisal = torch.sum(probs_topk * surprisal_topk, dim=-1, keepdim=True)  # Shape: (b, t, 1)
+                # Stack the moments and compute the mean
+                moment_losses = torch.stack(moment_losses)  # Shape: (num_moments,)
+                moment_loss = moment_losses.mean()
 
-            # Compute deviations from mean surprisal
-            deviations = surprisal_topk - mean_surprisal  # Shape: (b, t, k)
 
-            # Take absolute value of deviations
-            abs_deviations = deviations.abs()  # Shape: (b, t, k)
+                # Combine cross-entropy loss with moment loss
+                loss = ce_loss + self.config.moment_weight * moment_loss
+            else:
+                loss = ce_loss
 
-            # Expand dimensions for broadcasting
-            probs_expanded = probs_topk.unsqueeze(-1)  # Shape: (b, t, k, 1)
-            abs_deviations_expanded = abs_deviations.unsqueeze(-1)  # Shape: (b, t, k, 1)
-            moment_powers_expanded = self.moment_powers.view(1, 1, 1, -1)  # Shape: (1, 1, 1, n_moments)
-
-            # Compute powered deviations and weight by probabilities
-            powered = probs_expanded * abs_deviations_expanded.pow(moment_powers_expanded)  # Shape: (b, t, k, n_moments)
-
-            # Compute μₙ (n-th central moments)
-            mu_n = powered.sum(dim=2)  # Shape: (b, t, n_moments)
-
-            # Compute Dₙ = (μₙ)^(1/n)
-            D_n = mu_n.pow(1 / self.moment_powers.view(1, 1, -1))  # Shape: (b, t, n_moments)
-
-            # Normalize D_n by dividing by n^{1/n}
-            D_n = D_n / self.norm_constants.view(1, 1, -1)
-            # Project Dₙ to vocabulary space
-            moments_logits = self.moments_proj(D_n)  # Shape: (b, t, vocab_size)
-
-            # Combine original logits with moments contribution
-            logits = self.logits_weight * logits + self.moments_weight * moments_logits
-
-            # Compute loss
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-
-            if self.config.plot_moments:
-                self.plot_moments_statistics(D_n, targets.size(0), 'train')
+            return logits, loss, ce_loss
         else:
-            # Inference mode adjustments
-            logits = self.lm_head(x[:, [-1], :])  # Shape: (b, 1, vocab_size)
-
-            # Select top k tokens
-            top_k = 300
-            logits_topk, indices = torch.topk(logits, k=top_k, dim=-1)
-
-            # Compute probabilities over top k tokens
-            epsilon = 1e-10
-            probs_topk = F.softmax(logits_topk, dim=-1) + epsilon  # Shape: (b, 1, k)
-
-            # Compute surprisal (negative log probabilities)
-            surprisal_topk = -torch.log(probs_topk)  # Shape: (b, 1, k)
-
-            # Compute mean surprisal
-            mean_surprisal = torch.sum(probs_topk * surprisal_topk, dim=-1, keepdim=True)  # Shape: (b, 1, 1)
-
-            # Compute deviations
-            deviations = surprisal_topk - mean_surprisal  # Shape: (b, 1, k)
-            abs_deviations = deviations.abs()  # Shape: (b, 1, k)
-
-            # Expand dimensions for broadcasting
-            probs_expanded = probs_topk.unsqueeze(-1)  # Shape: (b, 1, k, 1)
-            abs_deviations_expanded = abs_deviations.unsqueeze(-1)  # Shape: (b, 1, k, 1)
-            moment_powers_expanded = self.moment_powers.view(1, 1, 1, -1)  # Shape: (1, 1, 1, n_moments)
-
-            # Compute powered deviations and weight by probabilities
-            powered = probs_expanded * abs_deviations_expanded.pow(moment_powers_expanded)  # Shape: (b, 1, k, n_moments)
-
-            # Compute μₙ (n-th central moments)
-            mu_n = powered.sum(dim=2)  # Shape: (b, 1, n_moments)
-
-            # Compute Dₙ = (μₙ)^(1/n)
-            D_n = mu_n.pow(1 / self.moment_powers.view(1, 1, -1))  # Shape: (b, 1, n_moments)
-
-            # Project Dₙ to vocabulary space
-            moments_logits = self.moments_proj(D_n)  # Shape: (b, 1, vocab_size)
-
-            # Combine logits
-            logits = self.logits_weight * logits + self.moments_weight * moments_logits
+            # In inference mode
+            logits = self.lm_head(x[:, [-1], :])  # Take only the last time step
             loss = None
-
-            if self.config.plot_moments:
-                self.plot_moments_statistics(D_n, idx.size(1), 'inference')
 
         return logits, loss
 
@@ -442,120 +363,27 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
         for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-
-            # Forward pass
-            x = self.transformer.wte(idx_cond)
-            pos = torch.arange(0, idx_cond.size(1), dtype=torch.long, device=idx.device)
-            x += self.transformer.wpe(pos)
-            x = self.transformer.drop(x)
-            for block in self.transformer.h:
-                x = block(x)
-            x = self.transformer.ln_f(x)
-
-            # Compute logits for the last position
-            logits = self.lm_head(x[:, [-1], :])  # Shape: (b, 1, vocab_size)
-
-            # Select top k tokens
-            top_k_value = 300
-            logits_topk, indices = torch.topk(logits, k=top_k_value, dim=-1)  # Shape: (b, 1, k)
-
-            # Compute probabilities over top k tokens
-            epsilon = 1e-10
-            probs_topk = F.softmax(logits_topk, dim=-1) + epsilon  # Shape: (b, 1, k)
-
-            # Compute surprisal (negative log probabilities)
-            surprisal_topk = -torch.log(probs_topk)  # Shape: (b, 1, k)
-
-            # Compute mean surprisal
-            mean_surprisal = torch.sum(probs_topk * surprisal_topk, dim=-1, keepdim=True)  # Shape: (b, 1, 1)
-
-            # Compute deviations
-            deviations = surprisal_topk - mean_surprisal  # Shape: (b, 1, k)
-            abs_deviations = deviations.abs()  # Shape: (b, 1, k)
-
-            # Expand dimensions for broadcasting
-            probs_expanded = probs_topk.unsqueeze(-1)  # Shape: (b, 1, k, 1)
-            abs_deviations_expanded = abs_deviations.unsqueeze(-1)  # Shape: (b, 1, k, 1)
-            moment_powers_expanded = self.moment_powers.view(1, 1, 1, -1)  # Shape: (1, 1, 1, n_moments)
-
-            # Compute powered deviations and weight by probabilities
-            powered = probs_expanded * abs_deviations_expanded.pow(moment_powers_expanded)  # Shape: (b, 1, k, n_moments)
-
-            # Compute μₙ (n-th central moments)
-            mu_n = powered.sum(dim=2)  # Shape: (b, 1, n_moments)
-
-            # Compute Dₙ = (μₙ)^(1/n)
-            D_n = mu_n.pow(1 / self.moment_powers.view(1, 1, -1))  # Shape: (b, 1, n_moments)
-
-            # Project Dₙ to vocabulary space
-            moments_logits = self.moments_proj(D_n)  # Shape: (b, 1, vocab_size)
-
-            # Combine original logits with moments contribution
-            logits = self.logits_weight * logits + self.moments_weight * moments_logits
-
-            # Apply temperature
-            logits = logits / temperature
-
-            # Optionally apply top_k filtering
+            # forward the model to get the logits for the index in the sequence
+            logits, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, :, [-1]]] = -float('Inf')
-
-            # Compute probabilities and sample
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs.squeeze(1), num_samples=1)
-
-            # Append sampled index to the sequence
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
-
-    def plot_moments_statistics(self, moments, step_or_token, prefix='train'):
-        """
-        Plot moment values against their orders
-        moments: tensor of shape (batch_size, seq_len, n_moments) or (batch_size, n_moments)
-        step_or_token: current training step or token position (for filename)
-        prefix: string to prefix the filename with
-        """
-        if not self.config.plot_moments:
-            return
-        
-        # Create directory if it doesn't exist
-        os.makedirs(self.config.moments_plot_dir, exist_ok=True)
-        
-        # Convert moments to numpy and take mean across batch dimension
-        if len(moments.shape) == 3:
-            # For training data (batch, seq_len, n_moments)
-            # Average across batch and take the last sequence position
-            moments = moments.mean(dim=0)[-1]
-        elif len(moments.shape) == 2:
-            # For inference data (batch, n_moments)
-            # Average across batch
-            moments = moments.mean(dim=0)
-        
-        moments = moments.detach().cpu().numpy()
-        moment_orders = self.moment_powers.cpu().numpy()
-        
-        # Create plot
-        plt.figure(figsize=(10, 6))
-        plt.plot(moment_orders, moments, 'b-', linewidth=2)
-        plt.scatter(moment_orders, moments, c='blue', alpha=0.5)
-        
-        plt.xlabel('Moment Order')
-        plt.ylabel('Moment Value')
-        plt.title(f'Moment Values vs Order (Step {step_or_token})')
-        plt.grid(True, alpha=0.3)
-        
-        # Add some padding to the axes
-        plt.margins(x=0.05)
-        
-        # Save plot
-        filename = f'{prefix}_moments_step_{step_or_token}.png'
-        plt.savefig(os.path.join(self.config.moments_plot_dir, filename))
-        plt.close()
-
-
-
-

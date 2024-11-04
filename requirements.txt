@@ -6,3 +6,4 @@ tiktoken
 wandb
 tqdm
 pytest
+matplotlib
